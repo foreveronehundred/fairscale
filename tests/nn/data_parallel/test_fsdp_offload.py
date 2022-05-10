@@ -16,15 +16,16 @@ import torch
 from torch import nn
 import torch.distributed
 
+try:
+    import fairscale.experimental.nn.ssd_offload as so
+except ImportError as ie:
+    # Note: We need the nightly version for SSD offload to work. Hence I am checking for the next PyTorch release.
+    pytestmark = pytest.mark.skipif(True, reason=ie.msg)
+    pass
+
 from fairscale.nn.checkpoint.checkpoint_activations import checkpoint_wrapper
 from fairscale.nn.data_parallel import FullyShardedDataParallel, OffloadConfig, TrainingState
-from fairscale.utils import torch_version
 from fairscale.utils.testing import dist_init, spawn_for_all_world_sizes
-
-# Note: We need the nightly version for SSD offload to work. Hence I am checking for the next PyTorch release.
-print(f"torch version {torch_version()}")
-pytestmark = pytest.mark.skipif(torch_version() < (1, 11, 0), reason="requires torch version >= 1.11.0")
-
 
 # How to use remote-pdb: https://gist.github.com/sshleifer/9d43351957179c13606e015b072927d4
 # All helper functions called by spawn must be either @classmethod, @staticmethod
@@ -136,6 +137,7 @@ def rename_test(testcase_func, param_num, param):
 
 class TestSsdMemory(DistributedTest):
     def test_memory_benchmark(self):
+
         test_fn = functools.partial(self._test_memory_benchmark, config={})
         spawn_and_init(test_fn)
 
@@ -214,6 +216,7 @@ class TimeKeeper:
 class TestModuleProperties(DistributedTest):
     @parameterized.expand(CONFIG, name_func=rename_test)
     def test_named_parameters(self, config):
+
         test_fn = functools.partial(self._test_named_params, config=config)
         spawn_and_init(test_fn)
 
@@ -257,21 +260,26 @@ class TestModuleProperties(DistributedTest):
 class TestSsdLoading(DistributedTest):
     @parameterized.expand(CONFIG_OPTIONS, name_func=rename_test)
     def test_ssd_offloading_eval(self, config):
+
         test_fn = functools.partial(self._test_ssd_offload_eval, config=config)
         spawn_and_init(test_fn)
 
     @parameterized.expand(CONFIG, name_func=rename_test)
     def test_transformer_parameterized(self, config):
+
         spawn_and_init(functools.partial(self._test_identical_outputs_eval, TransformerWithSharedParams, config))
 
     @parameterized.expand(CONFIG_OPTIONS, name_func=rename_test)
     def test_ssd_offloading_train_flatten_params_wrapper(self, config):
+
         test_fn = functools.partial(self._test_ssd_offloading_train_flatten_params_wrapper, config=config)
         spawn_and_init(test_fn)
 
     @classmethod
     def _test_ssd_offloading_train_flatten_params_wrapper(self, rank, group, config):
         SIZE = 16 * 16
+        LR = 0.01
+        MOMENTUM = 0.1
         model = SimpleLinear(group, input_size=SIZE, output_size=SIZE, layers=4)
 
         with tempfile.TemporaryDirectory() as current_tempdir:
@@ -289,19 +297,62 @@ class TestSsdLoading(DistributedTest):
                 model = FullyShardedDataParallel(model, **config)
             model_device = torch.device("cuda")
             model.train()
-            optim = torch.optim.SGD(model.parameters(), lr=4, momentum=0.9)
+            optim = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)
+
+            checkpoint_file = tempfile.NamedTemporaryFile()
+            checkpoint_load_directory = tempfile.TemporaryDirectory(prefix="checkpoint_dir")
+
+            pre_checkpoint_last_output = None
+            post_checkpoint_last_output = None
+
+            ITERATIONS = 10
+
             # Inputs always cuda regardless of move_grads_cpu, or model.device
             with torch.cuda.amp.autocast(enabled=config.get("mixed_precision", False)):
-                for i in range(10):
+                for i in range(ITERATIONS):
                     optim.zero_grad()
                     input = model.get_input(torch.device("cuda"))
                     output = model(*input)
+                    pre_checkpoint_last_output = output
+                    """
+                    param_itr = iter(model.named_parameters())
+                    p_name, p_val = next(param_itr)
+                    print(f"i={i} pre_checkpoint {p_name} = {p_val[0].item()}")
+                    """
+                    loss = model.module.get_loss(input, output).to(model_device)
+                    assert loss.dtype == torch.float32
+                    model.module.run_backward(loss)
+                    optim.step()
+                    if i == 0:
+                        with so.CheckpointPathContextManager(override_path=checkpoint_load_directory.name):
+                            # so.torch_saver.save({"model": model.state_dict(), "optim": optim.state_dict()}, checkpoint_file.name)
+                            torch.save({"model": model.state_dict()}, checkpoint_file.name)
+                        # reset momentum just after checkpoint save
+                        optim = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)
+
+                checkpoint = torch.load(checkpoint_file.name)
+                model.load_state_dict(checkpoint["model"])
+                # reset momentum just after checkpoint load
+                optim = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)
+                # do more iterations after loading checkpoint
+                for i in range(ITERATIONS - 1):
+                    optim.zero_grad()
+                    input = model.get_input(torch.device("cuda"))
+                    output = model(*input)
+                    post_checkpoint_last_output = output
+                    """
+                    param_itr = iter(model.named_parameters())
+                    p_name, p_val = next(param_itr)
+                    print(f"i={i} post_checkpoint {p_name} = {p_val[0].item()}")
+                    """
                     loss = model.module.get_loss(input, output).to(model_device)
                     assert loss.dtype == torch.float32
 
                     model.module.run_backward(loss)
                     optim.step()
 
+            # Verify output of checkpoint load + run is equal to original output
+            assert torch.equal(pre_checkpoint_last_output, post_checkpoint_last_output)
             if isinstance(model, FullyShardedDataParallel):
                 model.assert_state(TrainingState.IDLE)
 
@@ -445,6 +496,12 @@ def spawn_and_init(fn, args=None, **spawn_kwargs):
         args = ()
 
     run_fn = functools.partial(init_and_run, fn, args)
+
+    # Below 3 lines are to easily enable single-process debugging
+    # _, filename = tempfile.mkstemp()
+    # _, filename_rpc = tempfile.mkstemp()
+    # run_fn(0, 1, filename, filename_rpc)
+
     spawn_for_all_world_sizes(run_fn, **spawn_kwargs)
 
 

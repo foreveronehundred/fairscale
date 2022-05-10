@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 #
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
@@ -97,7 +97,7 @@ class FSDP:
         return {
             "avg_wps": 486.303,
             "std_dev_wps": 71.307,
-            "peak_mem_usage": [5.5055 * 2 ** 30, 5.5055 * 2 ** 30, 5.5055 * 2 ** 30, 5.5055 * 2 ** 30],
+            "peak_mem_usage": [5.5055 * 2**30, 5.5055 * 2**30, 5.5055 * 2**30, 5.5055 * 2**30],
         }
 
 

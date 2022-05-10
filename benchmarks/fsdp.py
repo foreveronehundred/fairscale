@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 #
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
@@ -267,7 +267,7 @@ def benchmark_language_model(model_config, model, benchmark_config, model_specs,
         print("Throughput(wps) is {:.2f}.".format(wps))
     print(
         "Peak allocated bytes on cuda:{}: {:4f}GB".format(
-            dist.get_rank(), torch.cuda.memory_stats(dist.get_rank())["allocated_bytes.all.peak"] / 2 ** 30
+            dist.get_rank(), torch.cuda.memory_stats(dist.get_rank())["allocated_bytes.all.peak"] / 2**30
         )
     )
 

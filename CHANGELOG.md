@@ -5,7 +5,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [0.4.6] - TBD
+## [0.4.7] - TBD
+
+### Added
+
+- FSDP: Add pickle/unpickle support for SsdTensorHandle (and derived classes),
+  verified that FSDP models w/ ssd_offload enabled can correctly call model.state_dict()
+  and model.load_state_dict(...) and thus successfully checkpoint and recover parameters
+  stored as SsdFlatParameters. [#964]
+- FSDP Ssd Offload: [#974]
+   * add __setattr__ function for SsdTensorHandle/SsdFlatParameter to capture when .data is overridden
+     and perform necessary checks/updates before letting the tensor metadata be updated.
+   * There was a bug in pytorch core that caused re-assigning TensorSubclass .data to
+     disable the __torch_dispatch__ mechanism and effectively revert back to a normal
+     tensor. Since ssd_offload feature uses __torch_dispatch__ extensively and FSDP overrides
+     .data, ssd_offload now can only be used if pytorch version is 1.12.0 or later
+     (currently pytorch-nightly release). pytest tests are disabled and trying to import
+     ssd_offload or use FSDP with ssd_offload enabled will raise ImportError Exceptions.
+   * Enhance storage_state ON_CPU into ON_CPU_CLEAN and ON_CPU_DIRTY. ON_CPU_CLEAN
+     indicates that the .tensor value and the value stored on disk are identical, and no
+     writes are needed when calling .to_file(). ON_CPU_DIRTY indicates .tensor does not
+     match value stored on disk, and a write is necessary. This is disabled in FSDP as
+     it does not currently flush variables to disk as soon as optimizer modifies values.
+   * Fix detection in SsdTensorHandle __torch_dispatch__ when it is used in an in-place
+     operator, or as an output, then calling mark_dirty().
+   * Fix grad_fn on SsdFlatParameterViews so that both ssd_flat_param.view.grad_fn points
+     to a split and view on ssd_flat_parameter so that when X.backwards() is called. ssd_flat_param.grad
+     is properly updated in the backward pass.
+   * Add unit tests to verify grad_fn and backward hooks are called appropriately on
+     SsdFlatParameters/SsdFlatParameterViews
+   * Implement SsdFlatParameter.from_tensor() direct_to_file option. This allows creating
+     and SsdFlatParameter and directly writing it to disk, rather than creating a new tensor
+     first. This prevents another copy of tensors to be instantiated and can save memory when
+     creating very large SsdFlatParameters.
+   * Add SsdFlatParameterViewProperty for overriding a parameter in an nn.Module
+     similar to pytorch core's parameterization code path. This allows SsdFlatParameterViews
+     to be updated as SsdFlatParameter.data is overridden by replacing Layer.weight with a
+     property whose getter returns ssd_flat_param.views[view_id].
+   * Added example SsdFlatParameterViewParameterization on how the existing parameterization
+     method could be used instead of SsdFlatParameterViewProperty. But this method will result
+     in memory inefficiencies due to parameterization always keeping a copy of the original
+     parameter internally.
+
+### Fixed
+
+
+[0.4.6] - 2022-03-08
 
 ### Added
 - CosFace's LMCL is added to MEVO. This is a loss function that is suitable
@@ -17,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   if set, wraps the root module regardless of how many unwrapped params there were
   left after children were wrapped. [#930]
 - FSDP: Add support for saving optimizer state when using expert replicas with FSDP.
+- OSS: Add a new arg "forced_broadcast_object" to OSS __init__ to apply "_broadcast_object"
+  for rebuilding the sharded optimizer. [#937]
+- FSDP: Add an arg disable_reshard_on_root for FSDP __init__ [#878]
+
+### Fixed
+- FSDP: fixed handling of internal states with state_dict and load_state_dict
+  function so that they don't change lazy init state if training hasn't started. [#922]
+- FSDP: added support of optimizer state handling when some of the parameters are
+  not used. An example is that in a model with a EMA copy that doesn't get trained
+  but still wants to be sharded. [#922]
 
 ## [0.4.5] - 2022-01-14
 

@@ -69,7 +69,11 @@ setup_venv: &setup_venv
   - run:
       name: Setup Virtual Env
       working_directory: ~/
+      # use bash -x for debug early commands executed in .bashrc.
+      shell: /bin/bash
       command: |
+        set -e
+        set -o pipefail
         python -m venv ~/venv
         echo ". ~/venv/bin/activate" >> $BASH_ENV
         . ~/venv/bin/activate
@@ -117,7 +121,7 @@ install_dep_pytorch_nightly: &install_dep_pytorch_nightly
         # check if we have restored venv cache (/home/circleci/venv) correctly, if so, just skip
         if [ -f /home/circleci/venv/check_version.py ]; then python /home/circleci/venv/check_version.py torch eq 1.12 && exit 0; fi
         # start installing
-        pip install --progress-bar off --pre torch==1.12.0.dev20220210+cu113 torchvision==0.13.0.dev20220210+cu113 -f https://download.pytorch.org/whl/nightly/cu113/torch_nightly.html
+        pip install --progress-bar off --pre torch==1.12.0.dev20220424+cu113 torchvision==0.13.0.dev20220424+cu113 -f https://download.pytorch.org/whl/nightly/cu113/torch_nightly.html
         pip install --progress-bar off -r requirements-dev.txt
         pip install --progress-bar off -r requirements-benchmarks.txt
         python -c 'import torch; print("Torch version:", torch.__version__)'
@@ -229,9 +233,15 @@ commands:
      steps:
        - run:
            name: Setup pyenv
+           # We used to use the following commands to update pyenv.
+           #   git clone https://github.com/pyenv/pyenv-update.git $(pyenv root)/plugins/pyenv-update
+           #   pyenv update
+           # However, it is not deterministic since pyenv is being updated.
+           # It is now fixed to a version. (v2.3.0 is broken since it cause bash to fail when it try to do "eval $(pyenv init -)")
            command: |
-             git clone https://github.com/pyenv/pyenv-update.git $(pyenv root)/plugins/pyenv-update
-             pyenv update
+             cd /opt/circleci/.pyenv/
+             git remote update
+             git checkout v2.2.0
              pyenv install -f <<parameters.version>>
              pyenv global <<parameters.version>>
 

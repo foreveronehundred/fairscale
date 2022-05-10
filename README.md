@@ -1,8 +1,9 @@
 ![FairScale Logo](./docs/source/_static/img/fairscale-logo.png)
 
+[![Support Ukraine](https://img.shields.io/badge/Support-Ukraine-FFD500?style=flat&labelColor=005BBB)](https://opensource.facebook.com/support-ukraine)
 ![PyPI](https://img.shields.io/pypi/v/fairscale)
 [![Documentation Status](https://readthedocs.org/projects/fairscale/badge/?version=latest)](https://fairscale.readthedocs.io/en/latest/?badge=latest)
-[![CircleCI](https://circleci.com/gh/facebookresearch/fairscale.svg?style=shield)](https://app.circleci.com/pipelines/github/facebookresearch/fairscale/) ![PyPI - License](https://img.shields.io/pypi/l/fairscale) [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/facebookresearch/fairscale/blob/main/CONTRIBUTING.md)
+[![CircleCI](https://circleci.com/gh/facebookresearch/fairscale.svg?style=shield)](https://app.circleci.com/pipelines/github/facebookresearch/fairscale/) ![PyPI - License](https://img.shields.io/pypi/l/fairscale) [![Downloads](https://pepy.tech/badge/fairscale)](https://pepy.tech/project/fairscale) [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/facebookresearch/fairscale/blob/main/CONTRIBUTING.md)
 --------------------------------------------------------------------------------
 
 ## Description
@@ -20,8 +21,14 @@ FairScale was designed with the following values in mind:
 
 * **Performance** - FairScale APIs provide the best performance in terms of scaling and efficiency.
 
+## Watch Introductory Video
+
+[![Explain Like I’m 5: FairScale](https://img.youtube.com/vi/oDt7ebOwWIc/0.jpg)](https://www.youtube.com/watch?v=oDt7ebOwWIc)
+
 ## What's New:
 
+* March 2022 [fairscale 0.4.6 was released](https://github.com/facebookresearch/fairscale/releases/tag/v0.4.6).
+* We have support for CosFace's LMCL in MEVO. This is a loss function that is suitable for large number of prediction target classes.
 * January 2022 [fairscale 0.4.5 was released](https://github.com/facebookresearch/fairscale/releases/tag/v0.4.5).
 * We have experimental support for layer wise gradient scaling.
 * We enabled reduce_scatter operation overlapping in FSDP backward propagation.

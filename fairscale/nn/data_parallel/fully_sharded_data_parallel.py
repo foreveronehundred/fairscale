@@ -66,7 +66,6 @@ else:
 
 try:
     import fairscale.experimental.nn.ssd_offload as ssd_offload
-    from fairscale.experimental.nn.ssd_offload import SsdFlatParameter
 
     import_ssd_offload = True
 except ImportError:
@@ -331,6 +330,7 @@ class FullyShardedDataParallel(nn.Module):
         cpu_offload: bool = False,
         offload_config: Optional[OffloadConfig] = None,
         state_dict_on_rank_0_only: bool = False,
+        gradient_predivide_factor: Optional[float] = None,
     ):
         try:
             import torch._C
@@ -398,8 +398,14 @@ class FullyShardedDataParallel(nn.Module):
         self.state_dict_on_rank_0_only = state_dict_on_rank_0_only
         # Experimental feature for now. Use at your own risk.
         self.ssd_offload = True if offload_config and offload_config.offload_type == "ssd_offload" else False
+        if self.ssd_offload and not import_ssd_offload:
+            raise ImportError(
+                f"Trying to enable ssd_offload when it was not successfully imported (likely due to old torch version, current = {torch.__version__})"
+            )
 
-        self.gradient_predivide_factor: float = self._get_gradient_predivide_factor(self.world_size)
+        self.gradient_predivide_factor: float = gradient_predivide_factor or self._get_gradient_predivide_factor(
+            self.world_size
+        )
         self.gradient_postdivide_factor: float = self.world_size / self.gradient_predivide_factor
 
         self.numel_padded_per_param: List[int] = []
@@ -697,7 +703,7 @@ class FullyShardedDataParallel(nn.Module):
             total_norm = local_norm
             dist.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=self.process_group)
         else:
-            total_norm = local_norm ** norm_type
+            total_norm = local_norm**norm_type
             dist.all_reduce(total_norm, group=self.process_group)
             total_norm = total_norm ** (1.0 / norm_type)
 
@@ -758,16 +764,14 @@ class FullyShardedDataParallel(nn.Module):
             p._is_sharded = True
 
             # Replace p.data with the relevant shard.
+            orig_data = p.data
+            p.data, num_padded = self._get_shard(p.data)
+            self.numel_padded_per_param.append(num_padded)
+
             if self.ssd_offload:
-                assert isinstance(p, SsdFlatParameter)
-                sharded_tensor, num_padded = self._get_shard(p.data)
-                p.point_to_resized_tensor(sharded_tensor)
-                self.numel_padded_per_param.append(num_padded)
+                assert isinstance(p, ssd_offload.SsdParameter)
                 p.to_file()
             else:
-                orig_data = p.data
-                p.data, num_padded = self._get_shard(p.data)
-                self.numel_padded_per_param.append(num_padded)
                 free_storage_(orig_data)
 
         assert len(self.numel_padded_per_param) == len(self.params)
@@ -796,6 +800,7 @@ class FullyShardedDataParallel(nn.Module):
         )
         if self.verbose:
             repr = (
+                f"self={id(self)} is_root={self._is_root}, "
                 f"rank={self.rank}, " + repr + f"reshard_after_forward={self.reshard_after_forward}, "
                 f"compute_dtype={self.compute_dtype}, "
                 f"buffer_dtype={self.buffer_dtype}, "
@@ -907,6 +912,7 @@ class FullyShardedDataParallel(nn.Module):
         """
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        is_uninitialized = self._is_root is None  # See comment below on why we use this.
         self._lazy_init()
 
         def maybe_cast_buffers(dtype: Optional[torch.dtype] = None) -> None:
@@ -931,6 +937,12 @@ class FullyShardedDataParallel(nn.Module):
 
         # In case we are in mixed precision, restore buffers back to buffer_dtype.
         maybe_cast_buffers()
+        # We shouldn't change the init state in case this was an inner module and
+        # users simply wanted to get state_dict before training.
+        if is_uninitialized and self._is_root:
+            for module in self.modules():
+                if isinstance(module, FullyShardedDataParallel):
+                    module._reset_lazy_init()
         return state_dict
 
     @typing.overload
@@ -976,7 +988,7 @@ class FullyShardedDataParallel(nn.Module):
     def _move_params_to_memory(self) -> None:
         """Move params from disk to CPU."""
         for p in self.params:
-            assert isinstance(p, SsdFlatParameter)
+            assert isinstance(p, ssd_offload.SsdParameter)
             p.to_tensor()
 
     def _load_state_dict(
@@ -999,7 +1011,15 @@ class FullyShardedDataParallel(nn.Module):
     def load_state_dict(
         self, state_dict: Union[Dict[str, torch.Tensor], "OrderedDict[str, torch.Tensor]"], strict: bool = True
     ) -> NamedTuple:
-        return self._load_state_dict(state_dict, strict)
+        is_uninitialized = self._is_root is None  # See comment below on why we use this.
+        sd = self._load_state_dict(state_dict, strict)
+        # We shouldn't change the init state in case this was an inner module and
+        # users simply wanted to load_state_dict before training.
+        if is_uninitialized and self._is_root:
+            for module in self.modules():
+                if isinstance(module, FullyShardedDataParallel):
+                    module._reset_lazy_init()
+        return sd
 
     def load_local_state_dict(
         self, state_dict: Union[Dict[str, torch.Tensor], "OrderedDict[str, torch.Tensor]"], strict: bool = True
@@ -1119,14 +1139,19 @@ class FullyShardedDataParallel(nn.Module):
                             # Copy any changes made to the full params back into
                             # the corresponding local shards.
                             local_shard, _ = self._get_shard(full_tensor)
-                            p._fp32_shard.copy_(local_shard.view_as(p._fp32_shard))
+                            if self.ssd_offload:
+                                assert isinstance(p, ssd_offload.SsdParameter)
+                                self._ssd_offload_reset_param_device(p)
+                                p.point_to_tensor(local_shard.view_as(p._fp32_shard).cpu())
+                            else:
+                                p._fp32_shard.copy_(local_shard.view_as(p._fp32_shard))
                         if safe_to_free:
                             free_storage_(full_tensor)
                     self.has_full_params = False
                     if self.ssd_offload:
                         # Store tensors in the SSD buffer and free param storage.
                         for p in self.params:
-                            assert isinstance(p, SsdFlatParameter)
+                            assert isinstance(p, ssd_offload.SsdParameter)
                             p.to_file()
                     else:
                         self._use_fp32_param_shard()
@@ -1262,10 +1287,11 @@ class FullyShardedDataParallel(nn.Module):
             # shard in pinned memory so that we can do a non-blocking transfer.
             # This is only needed during training and not evaluation.
             if self.ssd_offload:
-                assert isinstance(p, SsdFlatParameter)
+                assert isinstance(p, ssd_offload.SsdParameter)
                 # Gradients also need to be offloaded to SSD otherwise it can result in
                 # OOMs when the memory requirements of a model are larger than host memory.
                 p._cpu_grad = ssd_offload.SsdTensorHandle.from_tensor(torch.zeros_like(p.data, device="cpu"))
+                p._cpu_grad.allow_unsafe_changes = True
                 p._cpu_grad.set_file_params(p.filename + "_grad", 0)
                 p._cpu_grad.to_file()
             else:
@@ -1297,7 +1323,7 @@ class FullyShardedDataParallel(nn.Module):
             if n != "" and isinstance(m, FullyShardedDataParallel):
                 # We relax the assert for non-root instance, when the nested inialized module is wrapped
                 # again in FSDP later, for example after training to run inference.
-                assert m._is_root is None or not m._is_root
+                assert m._is_root is None or not m._is_root, f"offending FSDP instance is {id(m)}, {m}"
                 if m._is_root is None:
                     m._is_root = False
                 if m.process_group != self.process_group:
@@ -1422,7 +1448,7 @@ class FullyShardedDataParallel(nn.Module):
     def _free_ssd_offload(self) -> None:
         if self.ssd_offload:
             for p in self.params:
-                assert isinstance(p, SsdFlatParameter)
+                assert isinstance(p, ssd_offload.SsdParameter)
                 p.to_file(permit_when_tensor_none=True)
 
     def _register_pre_backward_hooks(self, outputs: Any) -> Any:
@@ -1878,8 +1904,10 @@ class FullyShardedDataParallel(nn.Module):
 
         if self.ssd_offload:
             for p in self.params:
-                assert isinstance(p, SsdFlatParameter)
-                p.to_tensor()
+                assert isinstance(p, ssd_offload.SsdParameter)
+                if not p.is_available():
+                    self._ssd_offload_reset_param_device(p)
+                    p.to_tensor()
 
             self.has_full_params = False
 
@@ -2157,12 +2185,24 @@ class FullyShardedDataParallel(nn.Module):
         return consolidated_weights
 
     @torch.no_grad()
+    def _ssd_offload_reset_param_device(self, param: Parameter) -> None:
+        assert isinstance(param, ssd_offload.SsdParameter)
+        if param.device != torch.device("cpu"):
+            param.data = param._fp32_shard
+            param.tensor = None
+
+    @torch.no_grad()
     def _use_fp32_param_shard(self, params: Optional[List[Parameter]] = None) -> None:
         """Use FP32 shard for a list of params."""
         if params is None:
             params = self.params
         for p in params:
-            p.data = p._fp32_shard
+            if import_ssd_offload and self.ssd_offload:
+                assert isinstance(p, ssd_offload.SsdParameter)
+                self._ssd_offload_reset_param_device(p)
+                p.to_tensor()
+            else:
+                p.data = p._fp32_shard
 
     @torch.no_grad()
     def _cast_fp32_param_shards_to_fp16(self, params: Optional[List[Parameter]] = None) -> None:
@@ -2173,11 +2213,14 @@ class FullyShardedDataParallel(nn.Module):
             for p in params:
                 assert p._fp16_shard is not None
                 alloc_storage_(p._fp16_shard, size=p._fp32_shard.size())
-                p._fp16_shard.copy_(
-                    # If move_params_to_cpu is True, this will be non-blocking
-                    # because _fp32_shard is pinned, otherwise it's a no-op.
-                    p._fp32_shard.to(p._fp16_shard.device, non_blocking=True)
-                )
+                if self.ssd_offload:
+                    p._fp16_shard.copy_(p.to(p._fp16_shard.device, non_blocking=True))
+                else:
+                    p._fp16_shard.copy_(
+                        # If move_params_to_cpu is True, this will be non-blocking
+                        # because _fp32_shard is pinned, otherwise it's a no-op.
+                        p._fp32_shard.to(p._fp16_shard.device, non_blocking=True)
+                    )
                 p.data = p._fp16_shard
         torch.cuda.current_stream().wait_stream(self._streams["fp32_to_fp16"])
 
@@ -2363,9 +2406,10 @@ class FullyShardedDataParallel(nn.Module):
         ids_not_to_shard = copy.deepcopy(full_optim_state_dict["uncollected_local_ids"])
         if self.flatten_parameters:
             full_optim_state_dict = ou.flatten_optim_state_dict(full_optim_state_dict)
-            assert len(full_optim_state_dict["state"]) in (
-                0,
-                len(instance_list),
+            # Due to unused params, the length of the state can be anywhere between
+            # 0 and number of params/fsdp_instance.
+            assert len(full_optim_state_dict["state"]) <= len(
+                instance_list
             ), f'{len(full_optim_state_dict["state"])}, {len(instance_list)}'
 
         # get the portion of dict associated with the shard, in place
@@ -2388,7 +2432,7 @@ class FullyShardedDataParallel(nn.Module):
         if restart:
             self._tstart = time.time()
         if self.rank == 0:
-            gb_denom = 1024 ** 3
+            gb_denom = 1024**3
             logging.info(
                 f"{msg} cur={torch.cuda.memory_allocated()/gb_denom: .4f} GB, max={torch.cuda.max_memory_allocated()/gb_denom: .4f} GB, t={time.time()-self._tstart: .1f}"
             )
